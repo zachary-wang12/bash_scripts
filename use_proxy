@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+#
+# use-proxy — manage shell proxy environment variables
+#
+#   source use-proxy                    # load the function into your shell
+#   use-proxy set --proxy http://localhost:7890
+#   use-proxy unset
+#   use-proxy help
+#
+# Works in both bash and zsh.
+
+# ---- internal helpers (private; prefixed with _up_) ------------------------
+
+# hex netmask 0xffffff00 -> 255.255.255.0
+_up_hex_to_dotted() {
+    local hex="${1#0x}"
+    while [[ ${#hex} -lt 8 ]]; do hex="0$hex"; done
+    printf '%s.%s.%s.%s\n' \
+        "$((16#${hex:0:2}))" "$((16#${hex:2:2}))" \
+        "$((16#${hex:4:2}))" "$((16#${hex:6:2}))"
+}
+
+# count prefix length from four mask octets: 255 255 255 0 -> 24
+_up_mask_to_prefix() {
+    local prefix=0 b
+    for b in "$@"; do
+        case "$b" in
+            255) prefix=$((prefix + 8));;
+            254) prefix=$((prefix + 7));;
+            252) prefix=$((prefix + 6));;
+            248) prefix=$((prefix + 5));;
+            240) prefix=$((prefix + 4));;
+            224) prefix=$((prefix + 3));;
+            192) prefix=$((prefix + 2));;
+            128) prefix=$((prefix + 1));;
+            0);;
+        esac
+    done
+    printf '%s\n' "$prefix"
+}
+
+# ip + dotted mask -> network in CIDR: 192.168.1.5 255.255.255.0 -> 192.168.1.0/24
+_up_ipmask_to_cidr() {
+    local ip1 ip2 ip3 ip4 m1 m2 m3 m4
+    IFS=. read -r ip1 ip2 ip3 ip4 <<<"$1"
+    IFS=. read -r m1 m2 m3 m4 <<<"$2"
+    printf '%s.%s.%s.%s/%s\n' \
+        "$((ip1 & m1))" "$((ip2 & m2))" "$((ip3 & m3))" "$((ip4 & m4))" \
+        "$(_up_mask_to_prefix "$m1" "$m2" "$m3" "$m4")"
+}
+
+# print one CIDR per line for every network subnet of a container runtime whose
+# CLI is Docker-compatible (docker, podman). $1 is the runtime name. Stays
+# silent if the runtime is missing or its daemon/machine is not running.
+_up_runtime_subnets() {
+    local rt="$1"
+    "$rt" network ls -q 2>/dev/null | while IFS= read -r netid; do
+        [[ -z "$netid" ]] && continue
+        "$rt" network inspect "$netid" \
+            --format '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null
+    done
+}
+
+# print a comma-separated list of every local subnet (CIDR form): active
+# network interfaces plus every Docker network subnet.
+_up_subnets() {
+    local result="" addr ip prefix mask cidr sub
+    # --- active network interfaces ---
+    if command -v ip >/dev/null 2>&1 && ip -o -4 addr show >/dev/null 2>&1; then
+        # Linux `ip` command: field 4 is already "addr/prefix"
+        while IFS= read -r addr; do
+            [[ -z "$addr" ]] && continue
+            ip="${addr%%/*}"
+            [[ -z "$ip" || "$ip" == 127.* ]] && continue
+            prefix="${addr##*/}"
+            [[ -n "$result" ]] && result="$result,"
+            result="$result$ip/$prefix"
+        done < <(ip -o -4 addr show 2>/dev/null | awk '{print $4}')
+    elif command -v ifconfig >/dev/null 2>&1; then
+        # macOS / BSD ifconfig: "inet <ip> netmask <mask> broadcast ..."
+        while read -r ip mask; do
+            [[ -z "$ip" || "$ip" == 127.* ]] && continue
+            [[ "$mask" == 0x* ]] && mask=$(_up_hex_to_dotted "$mask")
+            [[ -z "$mask" ]] && mask=255.255.255.0
+            cidr=$(_up_ipmask_to_cidr "$ip" "$mask")
+            [[ -n "$result" ]] && result="$result,"
+            result="$result$cidr"
+        done < <(ifconfig 2>/dev/null | awk '/inet / {print $2, $4}')
+    fi
+    # --- Docker / Podman networks ---
+    local rt
+    for rt in docker podman; do
+        command -v "$rt" >/dev/null 2>&1 || continue
+        while IFS= read -r sub; do
+            [[ -z "$sub" ]] && continue
+            [[ -n "$result" ]] && result="$result,"
+            result="$result$sub"
+        done < <(_up_runtime_subnets "$rt")
+    done
+    printf '%s\n' "$result"
+}
+
+# de-duplicate a comma-separated list, preserving first-seen order
+_up_dedup_csv() {
+    [[ -z "$1" ]] && return
+    printf '%s\n' "$1" | awk -F, '
+        { for (i = 1; i <= NF; i++) {
+              v = $i; sub(/^[ \t]+/, "", v); sub(/[ \t]+$/, "", v)
+              if (v != "" && !seen[v]++) {
+                  out = (out == "" ? v : out "," v)
+              }
+          } }
+        END { print out }
+    '
+}
+
+_up_print_help() {
+    cat <<'EOF'
+use-proxy - manage shell proxy environment variables
+
+USAGE
+  use-proxy            (no subcommand — defaults to "set")
+  use-proxy set   [--proxy <url>] [--no-proxy <list>]
+  use-proxy unset
+  use-proxy help
+
+COMMANDS
+  set     Set http_proxy, https_proxy and no_proxy for the current shell.
+
+    --proxy <url>     Proxy address, e.g. http://localhost:7890
+                      If omitted, the value of the environment variable
+                      USE_PROXY is used instead.
+
+    --no-proxy <list> Comma-separated extra hosts/networks that should bypass
+                      the proxy. Added on top of the defaults and the active
+                      local subnets, e.g. "10.0.0.0/8,172.16.0.0/12".
+
+  unset   Unset http_proxy / https_proxy / no_proxy.
+
+  help    Show this help.
+
+NOTES
+  * http_proxy, https_proxy and no_proxy are set (lowercase, as specified),
+    and their UPPERCASE counterparts are set as well, since some tools only
+    read the uppercase form.
+  * no_proxy always includes loopback / common hosts, the CIDR of every active
+    local interface, and every Docker / Podman network subnet, so local /
+    container traffic never goes through the proxy.
+
+EXAMPLES
+  use-proxy set --proxy http://localhost:7890
+  USE_PROXY=http://localhost:7890; use-proxy set
+  use-proxy set --no-proxy 10.0.0.0/8,myhost.local
+  use-proxy unset
+EOF
+}
+
+# ---- public entry point ----------------------------------------------------
+
+_up_set() {
+    local proxy="" extra_np=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --proxy)
+                [[ $# -lt 2 ]] && { echo "use-proxy set: --proxy needs a value" >&2; return 2; }
+                proxy="$2"; shift 2 ;;
+            --no-proxy)
+                [[ $# -lt 2 ]] && { echo "use-proxy set: --no-proxy needs a value" >&2; return 2; }
+                extra_np="$2"; shift 2 ;;
+            -h|--help) _up_print_help; return 0 ;;
+            --) shift; break ;;
+            -*) echo "use-proxy set: unknown option: $1" >&2; return 2 ;;
+            *)  echo "use-proxy set: unexpected argument: $1" >&2; return 2 ;;
+        esac
+    done
+
+    # Resolve the proxy URL: explicit flag wins, otherwise fall back to $USE_PROXY.
+    [[ -z "$proxy" ]] && proxy="${USE_PROXY:-}"
+    if [[ -z "$proxy" ]]; then
+        echo "use-proxy set: no proxy given. Pass --proxy <url> or export USE_PROXY." >&2
+        return 1
+    fi
+
+    # Build no_proxy: common hosts + every local subnet + any user extras.
+    local common_np="localhost,127.0.0.0/8,::1,*.local"
+    local np="$common_np"
+    local subnets; subnets=$(_up_subnets)
+    [[ -n "$subnets" ]] && np="$np,$subnets"
+    [[ -n "$extra_np" ]] && np="$np,$extra_np"
+    np=$(_up_dedup_csv "$np")
+
+    export http_proxy="$proxy"  HTTP_PROXY="$proxy"
+    export https_proxy="$proxy" HTTPS_PROXY="$proxy"
+    export no_proxy="$np"       NO_PROXY="$np"
+
+    printf 'proxy enabled:\n  http(s)_proxy = %s\n  no_proxy      = %s\n' "$proxy" "$np"
+}
+
+_up_unset() {
+    unset http_proxy https_proxy no_proxy
+    unset HTTP_PROXY HTTPS_PROXY NO_PROXY
+    echo 'proxy disabled.'
+}
+
+use-proxy() {
+    local cmd="${1:-set}"
+    [[ $# -gt 0 ]] && shift
+    case "$cmd" in
+        set)            _up_set "$@" ;;
+        unset|off)      _up_unset ;;
+        help|-h|--help) _up_print_help ;;
+        *)
+            echo "use-proxy: unknown command '$cmd'" >&2
+            _up_print_help >&2
+            return 2
+            ;;
+    esac
+}
+
+# When run directly as a script (not sourced), forward to use-proxy.
+# (Bash only — keeps it silent when sourced under zsh.)
+if [[ -n "${BASH_SOURCE[0]:-}" && "${BASH_SOURCE[0]}" == "$0" ]]; then
+    use-proxy "$@"
+fi
