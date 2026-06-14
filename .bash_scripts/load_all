@@ -1,0 +1,20 @@
+# load_all — source every config file in this directory.
+# Use in ~/.bashrc or ~/.zshrc:
+#   . "$HOME/.bash_scripts/load_all"
+
+# Resolve this file's own directory (works when sourced in bash or zsh)
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    _la_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    _la_dir="$(cd "$(dirname "$0")" && pwd)"
+fi
+
+_la_self="$_la_dir/load_all"
+
+for _f in "$_la_dir"/*; do
+    [ -f "$_f" ] || continue
+    [ "$_f" = "$_la_self" ] && continue
+    . "$_f"
+done
+
+unset _la_dir _la_self _f
