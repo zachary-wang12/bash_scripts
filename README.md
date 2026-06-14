@@ -1,3 +1,3 @@
-# VIM-MAT
+# Self Used Bash Scripts
 
-This is a personal used vimrc file.
+These are some self-used bash scripts
